@@ -1,0 +1,3 @@
+CUDA_VISIBLE_DEVICES=1,2 python main_zos.py --verifier_to_use="qwen" --pipeline_config_path=configs/flux.1_dev.json --prompt="A woman is holding a cup close to her nose, tilting it slightly while inhaling its aroma" --num_prompts=None --search_rounds=3 --n_candidates=4 --d_metric="euclidean" --lambda_val=None --max_new_tokens=1600
+
+CUDA_VISIBLE_DEVICES=1,2 python main_zos.py --verifier_to_use="qwen" --pipeline_config_path=configs/sdxl.json --prompt="A woman is holding a cup close to her nose, tilting it slightly while inhaling its aroma" --num_prompts=None --search_rounds=3 --n_candidates=4 --d_metric="euclidean" --lambda_val=None --max_new_tokens=1600

@@ -3,5 +3,5 @@
     "torch_dtype": "fp16",
     "height": 512,
     "width": 512,
-    "negative_prompt": "bad quality, worse quality, degenerate quality" 
+    "negative_prompt": ["bad quality, worse quality, degenerate quality"]
 }

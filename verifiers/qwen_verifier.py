@@ -5,6 +5,8 @@ import outlines
 import torch
 from PIL import Image
 import os
+import typing
+import pydantic
 from typing import Union
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +59,7 @@ DEVICE_MAP = {
 
 class Score(BaseModel):
     explanation: str
+    # explanation: typing.Annotated[str, pydantic.StringConstraints(strip_whitespace=True, max_length=500)]
     score: float
 
 
@@ -129,5 +132,5 @@ class QwenVerifier:
         outputs = self.structured_generator(
             inputs["prompts"], inputs["images"], max_tokens=max_new_tokens, seed=self.seed
         )
-        outputs = [o.dict() for o in outputs]
+        outputs = [o.model_dump() for o in outputs]
         return outputs

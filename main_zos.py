@@ -8,7 +8,7 @@ from diffusers import DiffusionPipeline
 from tqdm.auto import tqdm
 import copy
 
-from utils import prompt_to_filename, get_noises, TORCH_DTYPE_MAP, get_latent_prep_fn, parse_cli_args, MODEL_NAME_MAP
+from utils import prompt_to_filename, get_noises, TORCH_DTYPE_MAP, get_latent_prep_fn, parse_cli_args, MODEL_NAME_MAP, get_candidates_zero_order_search
 
 # Non-configurable constants
 TOPK = 1  # Always selecting the top-1 noise for the next round
@@ -16,7 +16,7 @@ MAX_SEED = np.iinfo(np.int32).max  # To generate random seeds
 
 
 def sample(
-    noises: dict[int, torch.Tensor],
+    pivot_noises: dict[int, torch.Tensor],
     prompt: str,
     search_round: int,
     pipe: DiffusionPipeline,
@@ -26,8 +26,8 @@ def sample(
     config: dict,
 ) -> dict:
     """
-    For a given prompt, generate images using all provided noises in batches,
-    score them with the verifier, and select the top-K noise.
+    For a given prompt, generate images using candidates in the neighborhood of the pivot noise,
+    score them with the verifier, and select the best candidate.
     The images and JSON artifacts are saved under `root_dir`.
     """
     config_cp = copy.deepcopy(config)
@@ -39,23 +39,24 @@ def sample(
 
     images_for_prompt = []
     noises_used = []
-    seeds_used = []
+    idx_used = []
     prompt_filename = prompt_to_filename(prompt)
 
-    # Convert the noises dictionary into a list of (seed, noise) tuples.
-    noise_items = list(noises.items())
+    # Convert the noises dictionary into a list of (idx, noise) tuples.
+    noise_items = list(pivot_noises.items())
+    # print('noise_items: ', noise_items)
 
     # Process the noises in batches.
     for i in range(0, len(noise_items), batch_size_for_img_gen):
         batch = noise_items[i : i + batch_size_for_img_gen]
-        seeds_batch, noises_batch = zip(*batch)
+        idx_batch, noises_batch = zip(*batch)
         filenames_batch = [
-            os.path.join(root_dir, f"{prompt_filename}_i@{search_round}_s@{seed}.png") for seed in seeds_batch
+            os.path.join(root_dir, f"{prompt_filename}_i@{search_round}_s@{idx}.png") for idx in idx_batch
         ]
 
         if use_low_gpu_vram and verifier_to_use != "gemini":
             pipe = pipe.to("cuda:0")
-        print(f"Generating images for batch with seeds: {[s for s in seeds_batch]}.")
+        print(f"Generating images for batch with idx: {[s for s in idx_batch]}.")
 
         # Create a batched prompt list and stack the latents.
         batched_prompts = [prompt] * len(noises_batch)
@@ -67,15 +68,14 @@ def sample(
             pipe = pipe.to("cpu")
 
         # Iterate over the batch and save the images.
-        for seed, noise, image, filename in zip(seeds_batch, noises_batch, batch_images, filenames_batch):
+        for idx, noise, image, filename in zip(idx_batch, noises_batch, batch_images, filenames_batch):
             images_for_prompt.append(image)
             noises_used.append(noise)
-            seeds_used.append(seed)
+            idx_used.append(idx)
             image.save(filename)
 
     # Prepare verifier inputs and perform inference.
     verifier_inputs = verifier.prepare_inputs(images=images_for_prompt, prompts=[prompt] * len(images_for_prompt))
-    # print(verifier_inputs)
     print("Scoring with the verifier.")
     outputs = verifier.score(
         inputs=verifier_inputs,
@@ -89,9 +89,9 @@ def sample(
     )
 
     results = []
-    for json_dict, seed_val, noise in zip(outputs, seeds_used, noises_used):
+    for json_dict, idx_val, noise in zip(outputs, idx_used, noises_used):
         # Attach the noise tensor so we can select top-K.
-        merged = {**json_dict, "noise": noise, "seed": seed_val}
+        merged = {**json_dict, "noise": noise, "idx": idx_val}
         results.append(merged)
 
     # Sort by the chosen metric descending and pick top-K.
@@ -110,14 +110,14 @@ def sample(
 
     # Print debug information.
     for ts in topk_scores:
-        print(f"Prompt='{prompt}' | Best seed={ts['seed']} | Score={ts[choice_of_metric]}")
+        print(f"Prompt='{prompt}' | Best seed={ts['idx']} | Score={ts[choice_of_metric]}")
 
-    best_img_path = os.path.join(root_dir, f"{prompt_filename}_i@{search_round}_s@{topk_scores[0]['seed']}.png")
+    best_img_path = os.path.join(root_dir, f"{prompt_filename}_i@{search_round}_s@{topk_scores[0]['idx']}.png")
     datapoint = {
         "prompt": prompt,
         "search_round": search_round,
-        "num_noises": len(noises),
-        "best_noise_seed": topk_scores[0]["seed"],
+        "num_noises": len(pivot_noises),
+        "best_noise_idx": topk_scores[0]["idx"],
         "best_score": topk_scores[0][choice_of_metric],
         "choice_of_metric": choice_of_metric,
         "best_img_path": best_img_path,
@@ -126,11 +126,11 @@ def sample(
     best_json_filename = best_img_path.replace(".png", ".json")
     with open(best_json_filename, "w") as f:
         json.dump(datapoint, f, indent=4)
-    return datapoint
+    return datapoint, topk_scores[0]["noise"]
 
 
 @torch.no_grad()
-def main():
+def main_zos():
     """
     Main function:
       - Parses CLI arguments.
@@ -150,18 +150,27 @@ def main():
         "choice_of_metric": args.choice_of_metric,
         "verifier_to_use": args.verifier_to_use,
         "batch_size_for_img_gen": args.batch_size_for_img_gen,
+        # For zero-shot search
+        # "n_candidates": args.n_candidates,
+        # "d_metric": args.d_metric,
+        # "lambda_val": args.lambda_val,
     }
     with open(args.pipeline_config_path, "r") as f:
         config.update(json.load(f))
 
     search_rounds = args.search_rounds
     num_prompts = args.num_prompts
+    # For zero-shot search
+    n_candidates = args.n_candidates
+    d_metric = args.d_metric
+    lambda_val = args.lambda_val
+    lambda_dec_round = args.lambda_dec_round
 
     # Create a root output directory: output/{verifier_to_use}/{current_datetime}
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
     pipeline_name = config.pop("pretrained_model_name_or_path")
     root_dir = os.path.join(
-        "output",
+        "output_zos",
         MODEL_NAME_MAP[pipeline_name],
         config["verifier_to_use"],
         config["choice_of_metric"],
@@ -188,8 +197,6 @@ def main():
     torch_dtype = TORCH_DTYPE_MAP[config.pop("torch_dtype")]
     pipe = DiffusionPipeline.from_pretrained(pipeline_name, torch_dtype=torch_dtype)
     pipe.enable_model_cpu_offload()
-    # if not config["use_low_gpu_vram"]:
-    #     pipe = pipe.to("cuda:0")
     pipe.set_progress_bar_config(disable=True)
 
     # Load the verifier model.
@@ -203,21 +210,26 @@ def main():
         verifier = QwenVerifier(use_low_gpu_vram=config["use_low_gpu_vram"])
 
     # Main loop: For each search round and each prompt, generate images, verify, and save artifacts.
+    pivot_noise = None
     for round in range(1, search_rounds + 1):
         print(f"\n=== Round: {round} ===")
-        num_noises_to_sample = 2**round  # scale noise pool.
         for prompt in tqdm(prompts, desc="Sampling prompts"):
-            noises = get_noises(
+            pivot_noises = get_candidates_zero_order_search(
+                search_round=round,
+                pivot=pivot_noise,
+                distance_metric=d_metric,
+                lambda_val=lambda_val,
+                lambda_dec_round=lambda_dec_round,
+                num_candidates=n_candidates,
                 max_seed=MAX_SEED,
-                num_samples=num_noises_to_sample,
                 height=config["height"],
                 width=config["width"],
                 dtype=torch_dtype,
                 fn=get_latent_prep_fn(pipeline_name),
             )
-            print(f"Number of noise samples: {len(noises)}")
-            datapoint_for_current_round = sample(
-                noises=noises,
+            print(f"Number of noise samples: {len(pivot_noises)}")
+            datapoint_for_current_round, pivot_noise = sample(
+                pivot_noises=pivot_noises,
                 prompt=prompt,
                 search_round=round,
                 pipe=pipe,
@@ -229,4 +241,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main_zos()
